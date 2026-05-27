@@ -16,7 +16,7 @@ pose_model = core2.compile_model("model/yolov8n-pose.onnx","AUTO")
 output_node = pose_model.outputs[0]
 infer_cgr = cgr_model.create_infer_request()
 infer_pose = pose_model.create_infer_request()
-args = make_parser().parse_args()
+args, _ = make_parser().parse_known_args()
 tracker = BYTETracker(args, frame_rate=30)
 tracker_cgr=BYTETracker(args, frame_rate=60)
 
