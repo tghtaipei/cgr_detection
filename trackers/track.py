@@ -4,8 +4,25 @@ from functools import partial
 
 import torch
 
-from ultralytics.utils import IterableSimpleNamespace, yaml_load
-from ultralytics.utils.checks import check_yaml
+from ultralytics.utils import IterableSimpleNamespace
+try:
+    from ultralytics.utils import yaml_load
+except ImportError:
+    # ultralytics 8.3+ moved yaml_load out of the top-level utils namespace
+    try:
+        from ultralytics.utils.files import yaml_load
+    except ImportError:
+        import yaml
+        def yaml_load(file='', append_filename=False):
+            with open(file, errors='ignore', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            if append_filename:
+                data['yaml_file'] = str(file)
+            return data
+try:
+    from ultralytics.utils.checks import check_yaml
+except ImportError:
+    from ultralytics.utils import check_yaml
 
 from .bot_sort import BOTSORT
 from .byte_tracker import BYTETracker

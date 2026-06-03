@@ -3,7 +3,10 @@ import cv2
 import numpy
 import numpy as np
 from typing import Tuple
-import openvino.runtime as ov
+try:
+    import openvino as ov
+except ImportError:
+    import openvino.runtime as ov
 
 from bytetrack_init import bytetrack,make_parser
 from yolov8onnx.utils import xywh2xyxy, nms
@@ -11,12 +14,12 @@ from trackers.byte_tracker import BYTETracker
 
 core1 = ov.Core()
 core2 = ov.Core()
-cgr_model = core1.compile_model("model/yolov8n-cig.onnx", "AUTO")
-pose_model = core2.compile_model("model/yolov8n-pose.onnx","AUTO")
+cgr_model = core1.compile_model("models/last.onnx", "AUTO")
+pose_model = core2.compile_model("models/yolov8n-pose.onnx", "AUTO")
 output_node = pose_model.outputs[0]
 infer_cgr = cgr_model.create_infer_request()
 infer_pose = pose_model.create_infer_request()
-args = make_parser().parse_args()
+args, _ = make_parser().parse_known_args()
 tracker = BYTETracker(args, frame_rate=30)
 tracker_cgr=BYTETracker(args, frame_rate=60)
 
