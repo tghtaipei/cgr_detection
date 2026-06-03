@@ -1,4 +1,5 @@
 from datetime import datetime
+import time
 import cv2
 import numpy as np
 from ov_inference import cgr_detect_with_onnx
@@ -44,6 +45,23 @@ model=[2]
 # 人员信息列表，包括每个人的id与吸烟检测累计值，累计超过吸烟设定阈值就会被认为在吸烟
 ids = {}
 
+# ── 判定條件 1：10 秒內手靠近嘴部 2 次以上（高權重）──────────────────────
+mouth_approach_log = {}   # {id: [timestamp, ...]}  各次靠近的時間戳
+MOUTH_WINDOW        = 10.0  # 觀察窗口（秒）
+MOUTH_MIN_COUNT     = 2     # 窗口內最少靠近次數
+APPROACH_GAP        = 1.0   # 兩次靠近事件的最小間隔（秒），避免同一次靠近重複計數
+HIGH_WEIGHT_BONUS   = 15    # 觸發時加分
+
+# ── 判定條件 2：嫌疑人在同一位置超過 10 秒（一般權重）──────────────────────
+position_log = {}    # {id: {'ref_center': (cx, cy), 'start_time': float}}
+POSITION_WINDOW     = 10.0  # 停留時間門檻（秒）
+POSITION_MOVE_RATIO = 0.30  # 位移超過人體框寬/高的此比例才視為移動
+NORMAL_WEIGHT_BONUS = 8     # 觸發時加分
+
+# ── 防止同一條件在短時間內重複加分 ───────────────────────────────────────
+bonus_cooldown = {}   # {id: {'mouth': float, 'position': float}}
+BONUS_COOLDOWN_SEC  = 5.0   # 同一條件再次觸發的最短間隔（秒）
+
 
 def init_model(models):
     model[0]=models
@@ -70,26 +88,21 @@ def judge_smoke(pose_result, img, label):
     return 0
 
 
-def detect_and_draw(pose_result, img,opt):
-    smoking_threshold=opt.threshold
-    cgr_conf[0]=opt.cgr_conf
+def detect_and_draw(pose_result, img, opt):
+    smoking_threshold = opt.threshold
+    cgr_conf[0] = opt.cgr_conf
     cgrlabel = []
-    # 画人物框
+    now = time.time()
+
     for d in pose_result:
-        # 每个人员的id与置信度
         conf, idd = float(d.conf), None if d.id is None else int(d.id)
         if idd not in ids.keys():
-            # 加入人员追踪列表，idd为id，0为初始累计值
             ids[idd] = np.array([idd, 0])
-        # name = ('' if id is None else f'id:{id} ')
-        # label = (f'{name} {conf:.2f}' if conf else name)
-        # if conf > 0.3:
-        #     box_label(d.xyxy, img, lw, label)
 
-        # 判断吸烟状态
         condition = ids[idd]
         status = judge_smoke(d, img, cgrlabel)
-        # 吸烟状态阈值加10，不吸烟时每帧减少1，缓慢下降
+
+        # ── 原始吸菸判定邏輯（保持不變）────────────────────────────────
         if status == 2:
             if condition[1] < 100:
                 condition[1] += 10
@@ -103,22 +116,69 @@ def detect_and_draw(pose_result, img,opt):
             if condition[1] > 0:
                 condition[1] -= 1
 
-        # 若超过设定阈值就显示
+        # ── 條件 1：10 秒內手靠近嘴部 2 次以上（高權重 +15）────────────
+        if idd is not None and status >= 1:
+            log = mouth_approach_log.setdefault(idd, [])
+            # 距離上次靠近事件超過 APPROACH_GAP 秒才記錄新事件
+            if not log or (now - log[-1]) > APPROACH_GAP:
+                log.append(now)
+            # 清除窗口外的舊紀錄
+            mouth_approach_log[idd] = [t for t in log if now - t <= MOUTH_WINDOW]
+
+        if idd is not None and idd in mouth_approach_log:
+            recent = len(mouth_approach_log[idd])
+            last_bonus = bonus_cooldown.get(idd, {}).get('mouth', 0)
+            if recent >= MOUTH_MIN_COUNT and (now - last_bonus) >= BONUS_COOLDOWN_SEC:
+                condition[1] = min(100, int(condition[1]) + HIGH_WEIGHT_BONUS)
+                bonus_cooldown.setdefault(idd, {})['mouth'] = now
+                # 在畫面上標示觸發原因
+                x1, y1 = int(d.xyxy[0]), int(d.xyxy[1])
+                cv2.putText(img, f"[+{HIGH_WEIGHT_BONUS} Repeated]",
+                            (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (0, 200, 255), 2, cv2.LINE_AA)
+
+        # ── 條件 2：在同一位置停留超過 10 秒（一般權重 +8）─────────────
+        if idd is not None:
+            box = d.xyxy
+            cx = (float(box[0]) + float(box[2])) / 2
+            cy = (float(box[1]) + float(box[3])) / 2
+            bw = float(box[2]) - float(box[0])
+            bh = float(box[3]) - float(box[1])
+
+            if idd not in position_log:
+                position_log[idd] = {'ref_center': (cx, cy), 'start_time': now}
+            else:
+                ref_cx, ref_cy = position_log[idd]['ref_center']
+                moved_x = abs(cx - ref_cx) > POSITION_MOVE_RATIO * bw
+                moved_y = abs(cy - ref_cy) > POSITION_MOVE_RATIO * bh
+                if moved_x or moved_y:
+                    # 人物移動，重置參考點
+                    position_log[idd] = {'ref_center': (cx, cy), 'start_time': now}
+                else:
+                    # 人物未移動，檢查停留時間
+                    duration = now - position_log[idd]['start_time']
+                    last_bonus = bonus_cooldown.get(idd, {}).get('position', 0)
+                    if duration >= POSITION_WINDOW and (now - last_bonus) >= BONUS_COOLDOWN_SEC:
+                        condition[1] = min(100, int(condition[1]) + NORMAL_WEIGHT_BONUS)
+                        bonus_cooldown.setdefault(idd, {})['position'] = now
+                        x1, y1 = int(d.xyxy[0]), int(d.xyxy[1])
+                        cv2.putText(img, f"[+{NORMAL_WEIGHT_BONUS} Staying]",
+                                    (x1, y1 - 40), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.55, (255, 165, 0), 2, cv2.LINE_AA)
+
+        # ── 超過閾值顯示吸菸警告 ─────────────────────────────────────────
         if condition[1] > smoking_threshold:
             box_label(d.xyxy, img, 3, "Target is Smoking", (0, 0, 255))
-        # 更新人员信息列表
+
         ids[idd] = condition
-        # 画骨架
+
         if opt.skeleton:
             key_label(d.keypoints, img, img.shape, kpt_line=True)
 
     cgr_box = np.array([t[:4] for t in cgrlabel])
-    # cgr_score = np.array([t[4] for t in cgrlabel])
-    # cgr_box,cgr_score=cgr_update(cgr_box,cgr_score)
-    # 画香烟
     if opt.cig_box:
         for i in cgr_box:
-            box_label(i, img,3,label='Cig', color=(0, 0, 255), txt_color=(255, 255, 255))
+            box_label(i, img, 3, label='Cig', color=(0, 0, 255), txt_color=(255, 255, 255))
 
     return img
 
