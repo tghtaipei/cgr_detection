@@ -62,6 +62,10 @@ NORMAL_WEIGHT_BONUS = 8     # 觸發時加分
 bonus_cooldown = {}   # {id: {'mouth': float, 'position': float}}
 BONUS_COOLDOWN_SEC  = 5.0   # 同一條件再次觸發的最短間隔（秒）
 
+# ── 曾確認持有香菸的人員集合 ──────────────────────────────────────────────
+# 一旦某人被 status==2 確認，後續 status==1 改為累加而非遞減
+confirmed_smokers = set()  # {id, ...}
+
 
 def init_model(models):
     model[0]=models
@@ -102,15 +106,25 @@ def detect_and_draw(pose_result, img, opt):
         condition = ids[idd]
         status = judge_smoke(d, img, cgrlabel)
 
-        # ── 原始吸菸判定邏輯（保持不變）────────────────────────────────
+        # ── 吸菸判定計分邏輯 ─────────────────────────────────────────────
         if status == 2:
+            # 香菸確認：標記此人，每幀 +20
+            if idd is not None:
+                confirmed_smokers.add(idd)
             if condition[1] < 100:
-                condition[1] += 10
+                condition[1] += 20
             if condition[1] < smoking_threshold:
                 box_label(d.xyxy, img, 3, "Suspicious", (28, 172, 255))
         elif status == 1:
-            if condition[1] > 0:
-                condition[1] -= 1
+            # 手靠近嘴但沒香菸：
+            #   曾被確認抽菸 → +5（持續可疑行為仍累加）
+            #   未曾確認    → -1（原始行為，維持緩降）
+            if idd is not None and idd in confirmed_smokers:
+                if condition[1] < 100:
+                    condition[1] += 5
+            else:
+                if condition[1] > 0:
+                    condition[1] -= 1
             box_label(d.xyxy, img, 3, "Suspicious", (28, 172, 255))
         else:
             if condition[1] > 0:
