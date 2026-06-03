@@ -47,20 +47,23 @@ def cgr_detect(image, opt):
 
 
 def build_video_writer(output_path: str, width: int, height: int, fps: float) -> cv2.VideoWriter:
-    """Create a VideoWriter, trying mp4v first then XVID as fallback."""
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    """Create a VideoWriter using XVID codec inside AVI container (most universal)."""
+    # Force .avi extension regardless of what was passed
+    avi_path = os.path.splitext(output_path)[0] + '.avi'
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    writer = cv2.VideoWriter(avi_path, fourcc, fps, (width, height))
     if not writer.isOpened():
-        # Some builds of OpenCV on Linux don't support mp4v; try avc1/XVID
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        out_path_avi = output_path.rsplit('.', 1)[0] + '.avi'
-        writer = cv2.VideoWriter(out_path_avi, fourcc, fps, (width, height))
+        # XVID unavailable; fall back to MJPG which ships with almost every OpenCV build
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        writer = cv2.VideoWriter(avi_path, fourcc, fps, (width, height))
         if not writer.isOpened():
             raise RuntimeError(
-                "VideoWriter could not be opened with either mp4v or XVID codec.\n"
+                "VideoWriter could not be opened with XVID or MJPG codec.\n"
                 "Try: pip install opencv-python-headless --upgrade"
             )
-        print(f"[WARNING] mp4v not available; writing to {out_path_avi} (AVI format)")
+        print("[WARNING] XVID not available; using MJPG codec (larger file size)")
+    if avi_path != output_path:
+        print(f"[INFO] Output format fixed to AVI: {avi_path}")
     return writer
 
 
