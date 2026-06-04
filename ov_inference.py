@@ -11,6 +11,7 @@ except ImportError:
 from bytetrack_init import bytetrack,make_parser
 from yolov8onnx.utils import xywh2xyxy, nms
 from trackers.byte_tracker import BYTETracker
+from sahi_utils import sahi_infer
 
 core1 = ov.Core()
 core2 = ov.Core()
@@ -149,27 +150,41 @@ def rscale_box_with_padding(original_size,boxes, target_size,border):
     return boxes
 
 
-def cgr_detect_with_onnx(image):
-    img ,border= prepare_input(image)
-    start_time = time.time()
-    # Create tensor from external memory
+def _single_cgr_infer(image):
+    """Run one RT-DETR inference pass on a single patch/image."""
+    img, border = prepare_input(image)
     input_tensor = ov.Tensor(array=img)
-    # Set input tensor for models with one input
     infer_cgr.set_input_tensor(input_tensor)
     infer_cgr.infer()
-    # Get output tensor for models with one output
     output = infer_cgr.get_output_tensor()
     output_buffer = output.data
-    boxes, scores, class_ids = process_output(output_buffer, 0.25, 0.7, image, img,border)
-    boxes=np.array(boxes)
-    scores=np.array(scores)
-    class_ids=np.array(class_ids)
-    # boxes, result = bytetrack(boxes, scores,class_ids, tracker_cgr)
-    if isinstance(boxes, numpy.ndarray) and boxes.shape[0]!=0:
-        # boxes = xywh2xyxy_rescale(boxes, 0, False)
-        return boxes,scores
+    boxes, scores, class_ids = process_output(output_buffer, 0.25, 0.7, image, img, border)
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    if isinstance(boxes, numpy.ndarray) and boxes.shape[0] != 0:
+        return boxes, scores
+    return [], []
+
+
+def cgr_detect_with_onnx(image, use_sahi: bool = True):
+    """
+    Detect cigarettes in *image* (mouth ROI).
+
+    When use_sahi=True and the ROI is large enough, the image is sliced into
+    overlapping 320×320 patches (SAHI) before inference to improve recall of
+    small objects.  Results from all patches are merged with NMS.
+    """
+    if use_sahi:
+        boxes, scores = sahi_infer(image, _single_cgr_infer,
+                                   slice_size=320, overlap=0.2, iou_threshold=0.5)
     else:
-        return [],[]
+        boxes, scores = _single_cgr_infer(image)
+
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    if isinstance(boxes, numpy.ndarray) and boxes.shape[0] != 0:
+        return boxes, scores
+    return [], []
 
 def pose_estimate_with_onnx(frame):
     [height, width, _] = frame.shape
