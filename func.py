@@ -77,7 +77,9 @@ _smoke_available     = None  # 延遲初始化：None=未檢查, True/False=檢�
 #        'smoke_boxes': list, 'hit': bool}}
 SAHI_SAMPLE_INTERVAL = 1.0   # 每次採樣間隔（秒）
 SAHI_WINDOW_SEC      = 3.0   # 採樣窗口總長（秒）
+SAHI_PERSON_COOLDOWN = 10.0  # 同一人兩次窗口的最短間隔（秒）
 _sahi_state          = {}    # 每人的採樣狀態
+_sahi_last_close     = {}    # {id: float} 上次窗口關閉時間
 
 
 def init_model(models):
@@ -139,12 +141,16 @@ def detect_and_draw(pose_result, img, opt):
             if pose_active:
                 state = _sahi_state.get(idd)
                 if state is None:
-                    # 第一次偵測到吸菸姿勢，開啟窗口
-                    _sahi_state[idd] = {
-                        'window_start': now, 'last_sample': 0.0,
-                        'smoke_boxes': [], 'hit': False
-                    }
-                    state = _sahi_state[idd]
+                    # 10 秒冷卻內不重新開窗
+                    last_close = _sahi_last_close.get(idd, 0.0)
+                    if (now - last_close) < SAHI_PERSON_COOLDOWN:
+                        pass  # 冷卻中，跳過
+                    else:
+                        _sahi_state[idd] = {
+                            'window_start': now, 'last_sample': 0.0,
+                            'smoke_boxes': [], 'hit': False
+                        }
+                    state = _sahi_state.get(idd)
 
                 window_elapsed = now - state['window_start']
                 if window_elapsed <= SAHI_WINDOW_SEC:
@@ -159,8 +165,10 @@ def detect_and_draw(pose_result, img, opt):
                 person_smoke_boxes = state.get('smoke_boxes', [])
                 all_smoke_boxes.extend(person_smoke_boxes)
             else:
-                # 手放下，清除窗口狀態以便下次重新計時
-                _sahi_state.pop(idd, None)
+                # 手放下，若窗口仍開著則關閉並記錄冷卻起點
+                if idd in _sahi_state:
+                    _sahi_last_close[idd] = now
+                    _sahi_state.pop(idd, None)
 
         # ── 吸菸判定計分邏輯 ─────────────────────────────────────────────
         if status == 2:
@@ -221,7 +229,8 @@ def detect_and_draw(pose_result, img, opt):
                     cv2.putText(img, f"[+{SMOKE_BONUS} Smoke]",
                                 (x1, y1 - 60), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55, (0, 128, 255), 2, cv2.LINE_AA)
-            # 結算後清除窗口，等待下一次姿勢觸發
+            # 結算後記錄關閉時間，10 秒內不重新開窗
+            _sahi_last_close[idd] = now
             _sahi_state.pop(idd, None)
 
         # ── 條件 2：在同一位置停留超過 10 秒（一般權重 +8）─────────────
