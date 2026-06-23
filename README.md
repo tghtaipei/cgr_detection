@@ -1,88 +1,209 @@
-# 吸烟检测 Cigarette Detection
-YOLOv8-Pose + BYTETRACK + RTDETR Cigarette Detection + Openvino/Onnxruntime/TensorRT Deployment
-## 具体流程 Process
+# 吸菸行為偵測系統
 
->YOLOv8-pose首先检测图片中人体位置并抽取骨架信息，根据人体骨架姿态判断每个人的手肘弯曲程度以及手与嘴部距离；若判定成功，使用RTDETR对人嘴部位置进行香烟目标检测；若检出目标，则增加对该人的吸烟累计值，当累计值超过一定阈值后，判断为正在吸烟（连续时间判断，减少单帧判断造成的结果不稳定与不准确）。同时，如一段时间检测不到香烟，则累计值缓慢下降至阈值下（停止判断为吸烟状态）
-><br>为了对目标进行累计值计算，使用bytetrack算法追踪每个人体目标，保证每个人的ID不变
+YOLOv8-Pose 姿態估計 + ByteTrack 追蹤 + RT-DETR 香菸偵測 + SAHI 小目標增強 + 煙霧偵測  
+推論框架支援：OpenVINO / ONNX Runtime / TensorRT
 
-The project begins by YOLOv8-pose detecting human body positions and extracting skeletal information from images. Based on the skeletal poses, it assesses the elbow angles and the distance between hands and mouths for each individual. If successful, the RTDETR model is employed to detect cigarettes at the mouth zone.
+---
 
-Upon target detection, the cumulative smoking count for that individual increases. Smoking is determined when the cumulative count surpasses a predefined threshold, ensuring continuous judgment over time to minimize unstable and inaccurate single-frame assessments. In the absence of cigarette detection for a period, the cumulative count gradually decreases until reaching a lower threshold, indicating the cessation of smoking judgment.
+## 系統架構
 
-To facilitate cumulative calculations, the bytetrack algorithm is used to track each individual, ensuring consistent identification by preserving unique IDs for each person. This project aims to provide a reliable system for real-time monitoring of smoking behavior through skeletal and object detection.
+```
+輸入影像
+  │
+  ├─ YOLOv8-Pose      偵測人體位置、提取 17 個關節座標
+  │     └─ ByteTrack  跨幀追蹤，維持每人唯一 ID
+  │
+  ├─ RT-DETR（口部裁切）  每幀對嘴部區域進行香菸偵測
+  ├─ SAHI 香菸偵測        每 10 秒最多啟動一次，對上半身做切片推論
+  └─ YOLOv8n 煙霧偵測    每幀全畫面偵測煙霧
+```
 
-## 代码说明 Code Explanation
-### 模型使用
+---
 
->整体来看，现有的目标检测框架大致可以分为CNN based以及Transformer based。对于前者，通常又可以划分为以Faster RCNN和RetinaNet为代表的“学术派”和以YOLO系列为代表的“工业派”。但作为检测领域的另一个巨头——DETR系列，相关研究很少会涉及到“实用性”，大多数都还是在验证新模块、新改进和新优化的“可行性”。对于这个问题，百度近期（2023.4）提交了一份“答案”：[RT-DETR](https://arxiv.org/abs/2304.08069)。百度之所以做这么一件事，其目的是希望为工业界提供一款实用性较高的DETR系列的实时检测器。相较于最新的YOLOv8，RT-DETR以较短的训练时长（75~80 epoch）和较少的数据增强（没有马赛克增强）的策略，在同等测试条件下（640x640）展现出了更强的性能和更好的平衡，且检测速度也与YOLO系列相媲美。
->
->通过使用相同的数据集分别在YOLOv8n、YOLOv8s、YOLOv8m以及RTDETR-l上训练，发现RTDETR在模型性能上完全超越了YOLO系列，达到了0.95099 precision、0.92931	recall、0.9612 mAP50、0.61979 mAP50-95。因此，选用RTDETR作为香烟检测模型
->
->相对的，目前使用的RTDETR网络规模较大(120MB+)，如遇到算力不足问题，可重新训练较小的模型(可使用ultralytics训练，需要修改模型的YAML来修改网络规模)
-### 项目说明
-    │  bytetrack_init.py                  bytrack初始化与参数设定
-    │  byte_tracker.py                    替换ultralytics库下的trackers/byte_tracker.py
-    │  export.py                          从pt模型导出onnx模型
-    │  func.py                            程序逻辑处理主要函数，如吸烟判断函数
-    │  infer_main.py                      主程序，启动推理
-    │  ort_inference.py                   onnxruntime推理模块
-    │  ov_inference.py                    openvino推理模块    
-    │  qt_main.py                         GUI窗口启动
-    │  requirements.txt                   项目环境需求
-    │  trt_inference_detr.py              detr-tensorrt推理
-    │  trt_inference_yolo.py              yolo-tensorrt推理
-    │  un.ui                              qt的ui界面文件
-    │  trt_infer.ipynb                    从onnx模型生成本机的trt模型
-    ├─model                               模型文件夹
-    │      rtdetr-best.onnx               rtdetr的的onnx模型
-    │      rtdetr-best.pt                 rtdetr的的PT模型，可使用ultralytics库的RTDETR载入
-    │      rtdetr-best.trt                rtdetr的的trt模型(测试用,请重新生成)
-    │      yolov8m-pose.onnx              yolov8-pose的onnx模型
-    │      yolov8m-pose.trt               yolov8-pose的trt模型(测试用,请重新生成)
-    │      yolov8n-cig.onnx               yolov8的onnx模型
-    │      yolov8n-pose.onnx              yolov8-pose的onnx模型
-    │      yolov8n-cig.pt                 yolov8的pt模型
-    ├─trtmodel                            存放新的trt模型
-    ├─datasets                            训练用的香烟数据集
-    │  workflow.png                       程序工作流程图
-    │  funcall.png                        函数调用关系图
->更换推理框架：请修改func.py与infer_main.py中导入函数pose_estimate_with_onnx与cgr_detect_with_onnx的导入方式，可以选择ort_inference.py/ov_inference.py/trt_inference.py来导入上述函数，从而使用不同推理框架
-> 
->文件替换：由于ultralytics库原生追踪算法与其自己的推理绑定，因此修改了部分库代码，请用项目内文件byte_tracker.py 替换ultralytics库内trackers/byte_tracker.py来使用bytetrack追踪
+## 偵測邏輯與計分系統
 
-## 使用说明
+每個被追蹤的人都有一個 **吸菸分數（0–100）**，超過閾值（預設 50）即判定為正在吸菸。
 
-运行以下代码启动GUI窗口：
+### 基礎計分
 
-    python qt_main.py
+| 狀態 | 條件 | 分數變化 |
+|------|------|---------|
+| 香菸確認（status 2） | RT-DETR 在口部偵測到香菸 | +20 / 幀 |
+| 可疑姿勢（status 1） | 手靠近嘴但無香菸 | 曾確認吸菸者 +5；未確認者 -1 |
+| 無動作（status 0） | 手未抬起 | -1 / 幀 |
 
-或运行以下代码直接进行推理:
+### 加分條件
 
-    python infer_main.py
-    
-本程序默认为使用trt推理，因为rtdetr对于trt优化有着较大依赖（cpu推理约2000ms，gpu-ort推理约100ms，而gpu-trt推理可以加速到7ms，gpu为3090）
-打开GUI后，首先选择使用模型进行初始化，之后即可正常操作
+**條件 1 ── 10 秒內手靠近嘴部 2 次以上（+15）**
+- 記錄每次靠近事件的時間戳
+- 10 秒觀察窗口內累積 ≥ 2 次即觸發
+- 同一條件 5 秒內不重複加分
 
-GUI可调整香烟框、骨架、香烟置信度、检测阈值等（不建议修改这个），并支持保存（应在开始推理前勾选）
-点击“开始/继续”开始推理，界面实时显示推理效果
+**條件 2 ── 同一位置停留超過 10 秒（+8）**
+- 追蹤人體框中心點，位移超過框寬/高的 30% 才算移動
+- 停留超過 10 秒觸發
+- 同一條件 5 秒內不重複加分
 
-测试视频位于video文件夹内
+**條件 3a ── 偵測到煙霧與人物區域重疊（+10）**
+- 每幀對全畫面執行 YOLOv8n 煙霧偵測
+- 煙霧框與人體框重疊（含往上延伸 50% 範圍）即觸發
+- 5 秒冷卻
 
-### 注意事项
-在新设备使用时，应先使用trt_infer.ipynb按步骤生成每个onnx模型在本机对应的trt模型；
-<br>本程序已在3090服务器上使用tensorRT完成部署测试，但由于该服务器的pycharm不兼容某些32位的cuda dll，因此无法从pycharm启动（原因未知）
-<br>正确启动方式为：打开conda prompt，输入：
+**條件 3b ── SAHI 確認香菸（+10）**
+- 手肘角度 < 55° 時啟動採樣窗口
+- 每秒採樣 1 次，共 3 秒（最多 3 次 SAHI 推論）
+- 窗口結束後有命中即觸發
+- 10 秒冷卻，避免短時間重複觸發
 
-    cd C:\Users\Administrator\Desktop\cgr\cgr_detection
+---
 
-然后启动conda虚拟环境cgr，输入：
+## SAHI 香菸偵測
 
-    conda activate cgr
+**SAHI（Slicing Aided Hyper Inference）** 透過將影像切成重疊的小區塊分別推論，再合併結果，能有效偵測遠距離或畫面中較小的香菸目標。
 
-进入虚拟环境后通过控制台启动程序：
+### 工作流程
 
-    python qt_main.py
+```
+手肘角度 < 55°（吸菸姿勢）
+  │
+  ├─ 10 秒冷卻中 → 跳過
+  │
+  └─ 開啟 3 秒採樣窗口
+       ├─ t=0s → cgr_detect_sahi()  第 1 次
+       ├─ t=1s → cgr_detect_sahi()  第 2 次
+       ├─ t=2s → cgr_detect_sahi()  第 3 次
+       └─ t=3s 結算
+            ├─ 有命中 → 條件 3b +10，進入 10 秒冷卻
+            └─ 無命中 → 清除窗口，進入 10 秒冷卻
+```
 
-显示GUI界面后，首先选择检测模型，并点击初始化模型，之后即可正常使用
+### `cgr_detect_sahi()` 內部流程
 
+```
+傳入：全幀影像 + 人體框
+  │
+  ├─ 裁出上半身 ROI（人體框上 60%）
+  ├─ 切成重疊的 320×320 切片（重疊率 20%）
+  ├─ 每個切片 → RT-DETR 香菸偵測
+  ├─ 座標換算回全幀座標
+  └─ 全域 NMS 去除重複框
+```
 
+### 與原有口部裁切的差異
+
+| | 口部裁切 `cgr_detect()` | SAHI `cgr_detect_sahi()` |
+|--|------------------------|--------------------------|
+| 執行頻率 | 每幀 | 最多 3 次 / 10 秒 |
+| 偵測範圍 | 口部小區域 | 上半身整體 ROI |
+| 適合場景 | 近距離、香菸在嘴邊 | 遠距離、香菸在手持位置 |
+| 畫面標示 | 紅框 `Cig` | 藍框 `Cig-S` |
+
+---
+
+## 煙霧偵測
+
+使用 **YOLOv8n** 訓練的煙霧偵測模型，透過 ONNX Runtime 推論。
+
+- 模型路徑：`models/smoke_detector.onnx`
+- 置信度閾值：0.25（低閾值提升召回率，煙霧模型資料量較少）
+- 每幀對全畫面執行，偵測到的煙霧框顯示為橘色
+
+### 訓練方式
+
+使用 `train_smoke_colab.ipynb` 在 Google Colab（T4 GPU）訓練：
+- 資料集：[Roboflow smoke-gxoy3](https://universe.roboflow.com/naruesuan-university/smoke-gxoy3)（438 張）
+- 模型：YOLOv8n（無增強，直接訓練效果最佳）
+- 基準效能：mAP50 = 0.6665，Precision = 0.674，Recall = 0.618
+
+---
+
+## 模型說明
+
+### 香菸偵測模型（RT-DETR）
+相較於 YOLO 系列，RT-DETR 以較短訓練時長（75–80 epoch）和較少資料增強策略，在同等測試條件下（640×640）展現更強效能。
+
+訓練結果：Precision 0.951、Recall 0.929、mAP50 0.961、mAP50-95 0.620
+
+### 姿態估計模型（YOLOv8-Pose）
+提取人體 17 個關節點，計算手肘夾角與手嘴距離，作為吸菸姿勢的判斷依據。
+
+---
+
+## 檔案說明
+
+```
+cgr_detection/
+│
+├─ infer_main.py          主程式，啟動推論（桌面端）
+├─ infer_colab.py         Colab 推論腳本（無 GUI，讀取影片檔）
+├─ smoking_detection.ipynb Colab 完整推論流程筆記本
+├─ func.py                核心邏輯：吸菸判斷、計分、SAHI 採樣窗口
+├─ ov_inference.py        OpenVINO 推論模組（含 cgr_detect_sahi）
+├─ ort_inference.py       ONNX Runtime 推論模組
+├─ smoke_inference.py     煙霧偵測推論模組（ONNX Runtime）
+├─ qt_main.py             GUI 主視窗
+├─ bytetrack_init.py      ByteTrack 初始化與參數設定
+├─ train_smoke_colab.ipynb 煙霧偵測模型訓練（Google Colab）
+├─ train_smoke.py         煙霧偵測模型本機訓練腳本
+├─ trt_infer.ipynb        從 ONNX 生成本機 TensorRT 模型
+├─ requirements.txt       環境需求
+│
+└─ models/
+     ├─ last.onnx              RT-DETR 香菸偵測 ONNX 模型
+     ├─ yolov8n-pose.onnx      YOLOv8-Pose 姿態估計 ONNX 模型
+     └─ smoke_detector.onnx    YOLOv8n 煙霧偵測 ONNX 模型
+```
+
+---
+
+## 使用方式
+
+### 桌面端（GUI）
+
+```bash
+python qt_main.py
+```
+
+啟動後：選擇偵測模型 → 點擊初始化模型 → 開始推論
+
+GUI 可調整：香菸框顯示、骨架顯示、香菸置信度、偵測閾值、影片儲存
+
+### Colab 推論
+
+使用 `smoking_detection.ipynb`，依序執行：
+
+1. 確認 GPU（T4）
+2. Clone 專案（含模型）
+3. 安裝套件
+4. 上傳影片
+5. 執行偵測
+6. 預覽結果
+7. 下載結果影片
+
+### 本機推論（無 GUI）
+
+```bash
+python infer_main.py
+```
+
+---
+
+## 更換推論框架
+
+修改 `func.py` 與 `infer_main.py` 中的 import：
+
+```python
+# OpenVINO（預設）
+from ov_inference import pose_estimate_with_onnx, cgr_detect_with_onnx
+
+# ONNX Runtime
+from ort_inference import pose_estimate_with_onnx, cgr_detect_with_onnx
+```
+
+---
+
+## 注意事項
+
+- TensorRT 模型需在目標機器上重新生成（使用 `trt_infer.ipynb`）
+- 煙霧偵測模型（`smoke_detector.onnx`）已包含在 `models/` 資料夾，Clone 後即可使用
+- ByteTrack 需替換 ultralytics 函式庫內的追蹤器：以專案內 `byte_tracker.py` 替換 `ultralytics/trackers/byte_tracker.py`
