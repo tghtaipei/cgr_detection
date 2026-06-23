@@ -286,9 +286,9 @@ def cgr_detect(k, img, direction, label):
     count[0] += 1
     box = k.xyxy
     right = k.keypoints[0]
-    # 锁定嘴部位置
-    length = int(0.4 * (box[2] - box[0]))
-    lengths = int(0.3 * (box[3] - box[1]))
+    # 锁定嘴部位置（略微放大裁切範圍以提供 SAHI 更多上下文）
+    length = int(0.5 * (box[2] - box[0]))
+    lengths = int(0.4 * (box[3] - box[1]))
     box = box.astype(np.int32)
     box[1] = np.max([int(right[1]) - length, 0])
     box[3] = np.min([int(right[1]) + length, img.shape[0]])
