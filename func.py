@@ -105,14 +105,15 @@ def detect_and_draw(pose_result, img, opt):
     cgrlabel = []
     now = time.time()
 
-    # ── 條件 3：每幀執行一次全畫面煙霧偵測 ──────────────────────────────
+    # ── 條件 3：延遲初始化煙霧模型 ───────────────────────────────────────
     if _smoke_available is None:
         _smoke_available = smoke_inference.is_model_available()
         if _smoke_available:
-            print("[func] 煙霧偵測模型已啟用（條件 3）")
+            print("[func] 煙霧偵測模型已啟用（條件 3，SAHI 模式）")
         else:
             print("[func] 煙霧偵測模型未找到，條件 3 停用（請執行 train_smoke.py 後複製模型）")
-    smoke_boxes = smoke_inference.detect_smoke(img) if _smoke_available else []
+
+    all_smoke_boxes: list = []   # 收集所有人的煙霧框（供畫圖用）
 
     for d in pose_result:
         conf, idd = float(d.conf), None if d.id is None else int(d.id)
@@ -121,6 +122,14 @@ def detect_and_draw(pose_result, img, opt):
 
         condition = ids[idd]
         status = judge_smoke(d, img, cgrlabel)
+
+        # ── 條件 3：僅在手部角度 < 55° 時對該人執行 SAHI 煙霧偵測 ──────
+        person_smoke_boxes: list = []
+        if _smoke_available:
+            left_angle, right_angle = cal_angle(d.keypoints)
+            if min(left_angle, right_angle) < 55:
+                person_smoke_boxes = smoke_inference.detect_smoke_sahi(img, roi_xyxy=d.xyxy)
+                all_smoke_boxes.extend(person_smoke_boxes)
 
         # ── 吸菸判定計分邏輯 ─────────────────────────────────────────────
         if status == 2:
@@ -168,8 +177,8 @@ def detect_and_draw(pose_result, img, opt):
                             0.55, (0, 200, 255), 2, cv2.LINE_AA)
 
         # ── 條件 3：偵測到煙霧與人物區域重疊（中等權重 +10）────────────
-        if _smoke_available and smoke_boxes and idd is not None:
-            if smoke_inference.smoke_overlaps_person(smoke_boxes, d.xyxy):
+        if _smoke_available and person_smoke_boxes and idd is not None:
+            if smoke_inference.smoke_overlaps_person(person_smoke_boxes, d.xyxy):
                 last_smoke = smoke_cooldown.get(idd, 0)
                 if (now - last_smoke) >= BONUS_COOLDOWN_SEC:
                     condition[1] = min(100, int(condition[1]) + SMOKE_BONUS)
@@ -222,7 +231,7 @@ def detect_and_draw(pose_result, img, opt):
         for i in cgr_box:
             box_label(i, img, 3, label='Cig', color=(0, 0, 255), txt_color=(255, 255, 255))
         # 顯示煙霧偵測框（橘色）
-        for s in smoke_boxes:
+        for s in all_smoke_boxes:
             box_label(s[:4], img, 2, label=f'Smoke {s[4]:.2f}', color=(0, 128, 255), txt_color=(255, 255, 255))
 
     return img
