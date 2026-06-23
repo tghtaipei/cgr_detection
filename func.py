@@ -2,7 +2,7 @@ from datetime import datetime
 import time
 import cv2
 import numpy as np
-from ov_inference import cgr_detect_with_onnx
+from ov_inference import cgr_detect_with_onnx, cgr_detect_sahi
 # import trt_inference_detr
 # import trt_inference_yolo
 import smoke_inference
@@ -68,9 +68,18 @@ BONUS_COOLDOWN_SEC  = 5.0   # 同一條件再次觸發的最短間隔（秒）
 confirmed_smokers = set()  # {id, ...}
 
 # ── 條件 3：偵測到煙霧與人物重疊（中等權重 +10）────────────────────────
-SMOKE_BONUS         = 10    # 偵測到煙霧時加分
-smoke_cooldown      = {}    # {id: float}  上次觸發時間
-_smoke_available    = None  # 延遲初始化：None=未檢查, True/False=檢查結果
+SMOKE_BONUS          = 10    # 偵測到煙霧時加分
+smoke_cooldown       = {}    # {id: float}  上次觸發時間
+_smoke_available     = None  # 延遲初始化：None=未檢查, True/False=檢查結果
+
+# SAHI 採樣窗口：角度 < 55° 後，每隔 1 秒採樣一次，共採 3 秒
+# {id: {'window_start': float, 'last_sample': float,
+#        'smoke_boxes': list, 'hit': bool}}
+SAHI_SAMPLE_INTERVAL = 1.0   # 每次採樣間隔（秒）
+SAHI_WINDOW_SEC      = 3.0   # 採樣窗口總長（秒）
+SAHI_PERSON_COOLDOWN = 10.0  # 同一人兩次窗口的最短間隔（秒）
+_sahi_state          = {}    # 每人的採樣狀態
+_sahi_last_close     = {}    # {id: float} 上次窗口關閉時間
 
 
 def init_model(models):
@@ -105,7 +114,7 @@ def detect_and_draw(pose_result, img, opt):
     cgrlabel = []
     now = time.time()
 
-    # ── 條件 3：每幀執行一次全畫面煙霧偵測 ──────────────────────────────
+    # ── 條件 3：每幀全畫面煙霧偵測（簡單全幀，非 SAHI）────────────────────
     if _smoke_available is None:
         _smoke_available = smoke_inference.is_model_available()
         if _smoke_available:
@@ -114,6 +123,8 @@ def detect_and_draw(pose_result, img, opt):
             print("[func] 煙霧偵測模型未找到，條件 3 停用（請執行 train_smoke.py 後複製模型）")
     smoke_boxes = smoke_inference.detect_smoke(img) if _smoke_available else []
 
+    all_sahi_cig_boxes: list = []   # 收集所有人的 SAHI 香菸框（供畫圖用）
+
     for d in pose_result:
         conf, idd = float(d.conf), None if d.id is None else int(d.id)
         if idd not in ids.keys():
@@ -121,6 +132,45 @@ def detect_and_draw(pose_result, img, opt):
 
         condition = ids[idd]
         status = judge_smoke(d, img, cgrlabel)
+
+        # ── SAHI 香菸偵測：手角度 < 55° → 啟動採樣窗口，每秒採樣 1 次共 3 秒 ──
+        person_sahi_cig_boxes: list = []
+        if idd is not None:
+            left_angle, right_angle = cal_angle(d.keypoints)
+            pose_active = min(left_angle, right_angle) < 55
+
+            if pose_active:
+                state = _sahi_state.get(idd)
+                if state is None:
+                    # 10 秒冷卻內不重新開窗
+                    last_close = _sahi_last_close.get(idd, 0.0)
+                    if (now - last_close) < SAHI_PERSON_COOLDOWN:
+                        pass  # 冷卻中，跳過
+                    else:
+                        _sahi_state[idd] = {
+                            'window_start': now, 'last_sample': 0.0,
+                            'cig_boxes': [], 'hit': False
+                        }
+                    state = _sahi_state.get(idd)
+
+                if state is not None:
+                    window_elapsed = now - state['window_start']
+                    if window_elapsed <= SAHI_WINDOW_SEC:
+                        # 窗口內：每隔 SAHI_SAMPLE_INTERVAL 秒採樣一次
+                        if (now - state['last_sample']) >= SAHI_SAMPLE_INTERVAL:
+                            boxes = cgr_detect_sahi(img, person_xyxy=d.xyxy)
+                            state['last_sample'] = now
+                            if boxes:
+                                state['cig_boxes'] = boxes
+                                state['hit'] = True
+                    # 沿用窗口內最後一次有偵測到的結果（供畫圖）
+                    person_sahi_cig_boxes = state.get('cig_boxes', [])
+                    all_sahi_cig_boxes.extend(person_sahi_cig_boxes)
+            else:
+                # 手放下，若窗口仍開著則關閉並記錄冷卻起點
+                if idd in _sahi_state:
+                    _sahi_last_close[idd] = now
+                    _sahi_state.pop(idd, None)
 
         # ── 吸菸判定計分邏輯 ─────────────────────────────────────────────
         if status == 2:
@@ -167,7 +217,7 @@ def detect_and_draw(pose_result, img, opt):
                             (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX,
                             0.55, (0, 200, 255), 2, cv2.LINE_AA)
 
-        # ── 條件 3：偵測到煙霧與人物區域重疊（中等權重 +10）────────────
+        # ── 條件 3a：煙霧框與人物重疊 → 加分 ────────────────────────────
         if _smoke_available and smoke_boxes and idd is not None:
             if smoke_inference.smoke_overlaps_person(smoke_boxes, d.xyxy):
                 last_smoke = smoke_cooldown.get(idd, 0)
@@ -178,6 +228,22 @@ def detect_and_draw(pose_result, img, opt):
                     cv2.putText(img, f"[+{SMOKE_BONUS} Smoke]",
                                 (x1, y1 - 60), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55, (0, 128, 255), 2, cv2.LINE_AA)
+
+        # ── 條件 3b：SAHI 3 秒窗口內確認香菸 → 加分 ─────────────────────
+        state = _sahi_state.get(idd) if idd is not None else None
+        if (state is not None and state['hit']
+                and (now - state['window_start']) > SAHI_WINDOW_SEC):
+            last_smoke = smoke_cooldown.get(idd, 0)
+            if (now - last_smoke) >= BONUS_COOLDOWN_SEC:
+                condition[1] = min(100, int(condition[1]) + SMOKE_BONUS)
+                smoke_cooldown[idd] = now
+                x1, y1 = int(d.xyxy[0]), int(d.xyxy[1])
+                cv2.putText(img, f"[+{SMOKE_BONUS} SAHI Cig]",
+                            (x1, y1 - 80), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 100, 0), 2, cv2.LINE_AA)
+            # 結算後記錄關閉時間，10 秒內不重新開窗
+            _sahi_last_close[idd] = now
+            _sahi_state.pop(idd, None)
 
         # ── 條件 2：在同一位置停留超過 10 秒（一般權重 +8）─────────────
         if idd is not None:
@@ -224,6 +290,9 @@ def detect_and_draw(pose_result, img, opt):
         # 顯示煙霧偵測框（橘色）
         for s in smoke_boxes:
             box_label(s[:4], img, 2, label=f'Smoke {s[4]:.2f}', color=(0, 128, 255), txt_color=(255, 255, 255))
+        # 顯示 SAHI 香菸偵測框（藍色，區別於口部裁切的一般香菸框）
+        for s in all_sahi_cig_boxes:
+            box_label(s[:4], img, 2, label=f'Cig-S {s[4]:.2f}', color=(255, 100, 0), txt_color=(255, 255, 255))
 
     return img
 

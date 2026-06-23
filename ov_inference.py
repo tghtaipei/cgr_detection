@@ -186,6 +186,95 @@ def cgr_detect_with_onnx(image, use_sahi: bool = True):
         return boxes, scores
     return [], []
 
+
+def _nms_boxes(boxes_list: list, iou_thr: float = 0.45) -> list:
+    if not boxes_list:
+        return []
+    xs1 = np.array([b[0] for b in boxes_list])
+    ys1 = np.array([b[1] for b in boxes_list])
+    xs2 = np.array([b[2] for b in boxes_list])
+    ys2 = np.array([b[3] for b in boxes_list])
+    sc  = np.array([b[4] for b in boxes_list])
+    areas = (xs2 - xs1) * (ys2 - ys1)
+    order = sc.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(xs1[i], xs1[order[1:]])
+        yy1 = np.maximum(ys1[i], ys1[order[1:]])
+        xx2 = np.minimum(xs2[i], xs2[order[1:]])
+        yy2 = np.minimum(ys2[i], ys2[order[1:]])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        order = order[1:][iou <= iou_thr]
+    return [[float(xs1[i]), float(ys1[i]), float(xs2[i]), float(ys2[i]), float(sc[i])] for i in keep]
+
+
+def cgr_detect_sahi(img_full: np.ndarray, person_xyxy,
+                    conf_threshold: float = 0.25,
+                    slice_size: int = 320, overlap: float = 0.2) -> list:
+    """
+    SAHI 香菸偵測：對人體上半身 ROI 做重疊切片推論，合併後回傳全圖座標。
+
+    Args:
+        img_full:        原始 BGR 全幀影像
+        person_xyxy:     人體框 [x1, y1, x2, y2]
+        conf_threshold:  香菸置信度閾值
+        slice_size:      每個切片的邊長（像素）
+        overlap:         切片重疊比例
+
+    Returns:
+        list of [x1, y1, x2, y2, score]（座標為全幀像素）
+    """
+    orig_h, orig_w = img_full.shape[:2]
+    px1, py1, px2, py2 = [float(v) for v in person_xyxy]
+    body_h = py2 - py1
+
+    # 僅取上半身 60%（含頭部、手臂、嘴部），避免對下半身做無謂運算
+    roi_x1 = max(0, int(px1))
+    roi_y1 = max(0, int(py1))
+    roi_x2 = min(orig_w, int(px2))
+    roi_y2 = min(orig_h, int(py1 + body_h * 0.6))
+
+    region = img_full[roi_y1:roi_y2, roi_x1:roi_x2]
+    rh, rw = region.shape[:2]
+    if rh == 0 or rw == 0:
+        return []
+
+    step = max(1, int(slice_size * (1 - overlap)))
+    all_boxes: list = []
+
+    y = 0
+    while True:
+        y2s = min(y + slice_size, rh)
+        y1s = max(0, y2s - slice_size)
+        x = 0
+        while True:
+            x2s = min(x + slice_size, rw)
+            x1s = max(0, x2s - slice_size)
+            patch = region[y1s:y2s, x1s:x2s]
+            if patch.shape[0] > 0 and patch.shape[1] > 0:
+                boxes, scores = cgr_detect_with_onnx(patch)
+                for i, s in enumerate(scores):
+                    if float(s) > conf_threshold:
+                        b = boxes[i]
+                        all_boxes.append([
+                            float(b[0]) + x1s + roi_x1,
+                            float(b[1]) + y1s + roi_y1,
+                            float(b[2]) + x1s + roi_x1,
+                            float(b[3]) + y1s + roi_y1,
+                            float(s)
+                        ])
+            if x2s == rw:
+                break
+            x += step
+        if y2s == rh:
+            break
+        y += step
+
+    return _nms_boxes(all_boxes)
+
 def pose_estimate_with_onnx(frame):
     [height, width, _] = frame.shape
     length = max((height, width))

@@ -44,6 +44,95 @@ def is_model_available() -> bool:
     return _MODEL_PATH.exists()
 
 
+def _sahi_slices(img_w: int, img_h: int,
+                 slice_size: int = _INPUT_SIZE, overlap: float = 0.2) -> list[tuple]:
+    """產生覆蓋整張影像的重疊切片座標清單。"""
+    step = int(slice_size * (1 - overlap))
+    slices = []
+    y = 0
+    while True:
+        y2 = min(y + slice_size, img_h)
+        y1 = max(0, y2 - slice_size)
+        x = 0
+        while True:
+            x2 = min(x + slice_size, img_w)
+            x1 = max(0, x2 - slice_size)
+            slices.append((x1, y1, x2, y2))
+            if x2 == img_w:
+                break
+            x += step
+        if y2 == img_h:
+            break
+        y += step
+    return slices
+
+
+def detect_smoke_sahi(img: np.ndarray, roi_xyxy=None,
+                      conf_threshold: float = _CONF_THRESHOLD) -> list[list[float]]:
+    """
+    SAHI 切片煙霧偵測，在 roi_xyxy（人體框）周圍執行，
+    比全幀偵測更能抓到小煙霧，且只在有吸菸姿勢時才呼叫以節省運算。
+
+    Args:
+        img:       原始 BGR 全幀影像
+        roi_xyxy:  人體框 [x1, y1, x2, y2]；None 則對全圖執行 SAHI
+        conf_threshold: 置信度閾值
+
+    Returns:
+        list of [x1, y1, x2, y2, score]（座標為原始影像像素）
+    """
+    sess = _load_session()
+    if sess is None:
+        return []
+
+    orig_h, orig_w = img.shape[:2]
+
+    # 以人體框為中心擴展 ROI（左右各 50%，往上 80% 捕捉頭頂煙霧）
+    if roi_xyxy is not None:
+        px1, py1, px2, py2 = [float(v) for v in roi_xyxy]
+        mx = (px2 - px1) * 0.5
+        my = (py2 - py1) * 0.8
+        rx1 = max(0, int(px1 - mx))
+        ry1 = max(0, int(py1 - my))
+        rx2 = min(orig_w, int(px2 + mx))
+        ry2 = min(orig_h, int(py2))
+        region = img[ry1:ry2, rx1:rx2]
+        off_x, off_y = rx1, ry1
+    else:
+        region = img
+        off_x, off_y = 0, 0
+
+    rh, rw = region.shape[:2]
+    if rh == 0 or rw == 0:
+        return []
+
+    input_name = sess.get_inputs()[0].name
+    all_boxes: list[list[float]] = []
+
+    for (sx1, sy1, sx2, sy2) in _sahi_slices(rw, rh):
+        patch = region[sy1:sy2, sx1:sx2]
+        ph, pw = patch.shape[:2]
+        if ph == 0 or pw == 0:
+            continue
+        tensor, pad_info = _preprocess(patch)
+        output = sess.run(None, {input_name: tensor})[0]
+        boxes = _postprocess(output, pw, ph, pad_info, conf_threshold)
+        for b in boxes:
+            all_boxes.append([b[0] + sx1 + off_x, b[1] + sy1 + off_y,
+                               b[2] + sx1 + off_x, b[3] + sy1 + off_y, b[4]])
+
+    if not all_boxes:
+        return []
+
+    xs1 = np.array([b[0] for b in all_boxes])
+    ys1 = np.array([b[1] for b in all_boxes])
+    xs2 = np.array([b[2] for b in all_boxes])
+    ys2 = np.array([b[3] for b in all_boxes])
+    sc  = np.array([b[4] for b in all_boxes])
+    keep = _nms(xs1, ys1, xs2, ys2, sc, _IOU_THRESHOLD)
+    return [[float(xs1[i]), float(ys1[i]), float(xs2[i]), float(ys2[i]), float(sc[i])] for i in keep]
+
+
 def detect_smoke(img: np.ndarray, conf_threshold: float = _CONF_THRESHOLD) -> list[list[float]]:
     """
     對整張影像進行煙霧偵測
