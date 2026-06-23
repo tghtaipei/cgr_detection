@@ -18,7 +18,7 @@ from typing import Tuple
 _session = None
 _MODEL_PATH = Path(__file__).parent / "models" / "smoke_detector.onnx"
 _INPUT_SIZE = 640
-_CONF_THRESHOLD = 0.35
+_CONF_THRESHOLD = 0.25  # 降低閾值提升 Recall（現有模型資料量不足，Precision 高 Recall 低）
 _IOU_THRESHOLD = 0.45
 
 
