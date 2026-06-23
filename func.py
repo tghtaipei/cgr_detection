@@ -2,7 +2,7 @@ from datetime import datetime
 import time
 import cv2
 import numpy as np
-from ov_inference import cgr_detect_with_onnx
+from ov_inference import cgr_detect_with_onnx, cgr_detect_sahi
 # import trt_inference_detr
 # import trt_inference_yolo
 import smoke_inference
@@ -114,15 +114,16 @@ def detect_and_draw(pose_result, img, opt):
     cgrlabel = []
     now = time.time()
 
-    # ── 條件 3：延遲初始化煙霧模型 ───────────────────────────────────────
+    # ── 條件 3：每幀全畫面煙霧偵測（簡單全幀，非 SAHI）────────────────────
     if _smoke_available is None:
         _smoke_available = smoke_inference.is_model_available()
         if _smoke_available:
-            print("[func] 煙霧偵測模型已啟用（條件 3，SAHI 模式）")
+            print("[func] 煙霧偵測模型已啟用（條件 3）")
         else:
             print("[func] 煙霧偵測模型未找到，條件 3 停用（請執行 train_smoke.py 後複製模型）")
+    smoke_boxes = smoke_inference.detect_smoke(img) if _smoke_available else []
 
-    all_smoke_boxes: list = []   # 收集所有人的煙霧框（供畫圖用）
+    all_sahi_cig_boxes: list = []   # 收集所有人的 SAHI 香菸框（供畫圖用）
 
     for d in pose_result:
         conf, idd = float(d.conf), None if d.id is None else int(d.id)
@@ -132,9 +133,9 @@ def detect_and_draw(pose_result, img, opt):
         condition = ids[idd]
         status = judge_smoke(d, img, cgrlabel)
 
-        # ── 條件 3：手角度 < 55° → 啟動採樣窗口，每秒採樣 1 次共 3 秒 ──
-        person_smoke_boxes: list = []
-        if _smoke_available and idd is not None:
+        # ── SAHI 香菸偵測：手角度 < 55° → 啟動採樣窗口，每秒採樣 1 次共 3 秒 ──
+        person_sahi_cig_boxes: list = []
+        if idd is not None:
             left_angle, right_angle = cal_angle(d.keypoints)
             pose_active = min(left_angle, right_angle) < 55
 
@@ -148,22 +149,23 @@ def detect_and_draw(pose_result, img, opt):
                     else:
                         _sahi_state[idd] = {
                             'window_start': now, 'last_sample': 0.0,
-                            'smoke_boxes': [], 'hit': False
+                            'cig_boxes': [], 'hit': False
                         }
                     state = _sahi_state.get(idd)
 
-                window_elapsed = now - state['window_start']
-                if window_elapsed <= SAHI_WINDOW_SEC:
-                    # 窗口內：每隔 SAHI_SAMPLE_INTERVAL 秒採樣一次
-                    if (now - state['last_sample']) >= SAHI_SAMPLE_INTERVAL:
-                        boxes = smoke_inference.detect_smoke_sahi(img, roi_xyxy=d.xyxy)
-                        state['last_sample'] = now
-                        if boxes:
-                            state['smoke_boxes'] = boxes
-                            state['hit'] = True
-                # 不論窗口是否結束，都沿用窗口內最後一次有偵測到的結果（供畫圖）
-                person_smoke_boxes = state.get('smoke_boxes', [])
-                all_smoke_boxes.extend(person_smoke_boxes)
+                if state is not None:
+                    window_elapsed = now - state['window_start']
+                    if window_elapsed <= SAHI_WINDOW_SEC:
+                        # 窗口內：每隔 SAHI_SAMPLE_INTERVAL 秒採樣一次
+                        if (now - state['last_sample']) >= SAHI_SAMPLE_INTERVAL:
+                            boxes = cgr_detect_sahi(img, person_xyxy=d.xyxy)
+                            state['last_sample'] = now
+                            if boxes:
+                                state['cig_boxes'] = boxes
+                                state['hit'] = True
+                    # 沿用窗口內最後一次有偵測到的結果（供畫圖）
+                    person_sahi_cig_boxes = state.get('cig_boxes', [])
+                    all_sahi_cig_boxes.extend(person_sahi_cig_boxes)
             else:
                 # 手放下，若窗口仍開著則關閉並記錄冷卻起點
                 if idd in _sahi_state:
@@ -215,12 +217,9 @@ def detect_and_draw(pose_result, img, opt):
                             (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX,
                             0.55, (0, 200, 255), 2, cv2.LINE_AA)
 
-        # ── 條件 3：3 秒採樣窗口內有煙霧命中 → 加分 ──────────────────────
-        state = _sahi_state.get(idd) if idd is not None else None
-        if (_smoke_available and state is not None and state['hit']
-                and (now - state['window_start']) > SAHI_WINDOW_SEC):
-            # 窗口結束且有命中，結算一次
-            if smoke_inference.smoke_overlaps_person(state['smoke_boxes'], d.xyxy):
+        # ── 條件 3a：煙霧框與人物重疊 → 加分 ────────────────────────────
+        if _smoke_available and smoke_boxes and idd is not None:
+            if smoke_inference.smoke_overlaps_person(smoke_boxes, d.xyxy):
                 last_smoke = smoke_cooldown.get(idd, 0)
                 if (now - last_smoke) >= BONUS_COOLDOWN_SEC:
                     condition[1] = min(100, int(condition[1]) + SMOKE_BONUS)
@@ -229,6 +228,19 @@ def detect_and_draw(pose_result, img, opt):
                     cv2.putText(img, f"[+{SMOKE_BONUS} Smoke]",
                                 (x1, y1 - 60), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55, (0, 128, 255), 2, cv2.LINE_AA)
+
+        # ── 條件 3b：SAHI 3 秒窗口內確認香菸 → 加分 ─────────────────────
+        state = _sahi_state.get(idd) if idd is not None else None
+        if (state is not None and state['hit']
+                and (now - state['window_start']) > SAHI_WINDOW_SEC):
+            last_smoke = smoke_cooldown.get(idd, 0)
+            if (now - last_smoke) >= BONUS_COOLDOWN_SEC:
+                condition[1] = min(100, int(condition[1]) + SMOKE_BONUS)
+                smoke_cooldown[idd] = now
+                x1, y1 = int(d.xyxy[0]), int(d.xyxy[1])
+                cv2.putText(img, f"[+{SMOKE_BONUS} SAHI Cig]",
+                            (x1, y1 - 80), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 100, 0), 2, cv2.LINE_AA)
             # 結算後記錄關閉時間，10 秒內不重新開窗
             _sahi_last_close[idd] = now
             _sahi_state.pop(idd, None)
@@ -276,8 +288,11 @@ def detect_and_draw(pose_result, img, opt):
         for i in cgr_box:
             box_label(i, img, 3, label='Cig', color=(0, 0, 255), txt_color=(255, 255, 255))
         # 顯示煙霧偵測框（橘色）
-        for s in all_smoke_boxes:
+        for s in smoke_boxes:
             box_label(s[:4], img, 2, label=f'Smoke {s[4]:.2f}', color=(0, 128, 255), txt_color=(255, 255, 255))
+        # 顯示 SAHI 香菸偵測框（藍色，區別於口部裁切的一般香菸框）
+        for s in all_sahi_cig_boxes:
+            box_label(s[:4], img, 2, label=f'Cig-S {s[4]:.2f}', color=(255, 100, 0), txt_color=(255, 255, 255))
 
     return img
 
