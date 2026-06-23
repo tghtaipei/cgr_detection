@@ -68,9 +68,16 @@ BONUS_COOLDOWN_SEC  = 5.0   # 同一條件再次觸發的最短間隔（秒）
 confirmed_smokers = set()  # {id, ...}
 
 # ── 條件 3：偵測到煙霧與人物重疊（中等權重 +10）────────────────────────
-SMOKE_BONUS         = 10    # 偵測到煙霧時加分
-smoke_cooldown      = {}    # {id: float}  上次觸發時間
-_smoke_available    = None  # 延遲初始化：None=未檢查, True/False=檢查結果
+SMOKE_BONUS          = 10    # 偵測到煙霧時加分
+smoke_cooldown       = {}    # {id: float}  上次觸發時間
+_smoke_available     = None  # 延遲初始化：None=未檢查, True/False=檢查結果
+
+# SAHI 採樣窗口：角度 < 55° 後，每隔 1 秒採樣一次，共採 3 秒
+# {id: {'window_start': float, 'last_sample': float,
+#        'smoke_boxes': list, 'hit': bool}}
+SAHI_SAMPLE_INTERVAL = 1.0   # 每次採樣間隔（秒）
+SAHI_WINDOW_SEC      = 3.0   # 採樣窗口總長（秒）
+_sahi_state          = {}    # 每人的採樣狀態
 
 
 def init_model(models):
@@ -123,13 +130,37 @@ def detect_and_draw(pose_result, img, opt):
         condition = ids[idd]
         status = judge_smoke(d, img, cgrlabel)
 
-        # ── 條件 3：僅在手部角度 < 55° 時對該人執行 SAHI 煙霧偵測 ──────
+        # ── 條件 3：手角度 < 55° → 啟動採樣窗口，每秒採樣 1 次共 3 秒 ──
         person_smoke_boxes: list = []
-        if _smoke_available:
+        if _smoke_available and idd is not None:
             left_angle, right_angle = cal_angle(d.keypoints)
-            if min(left_angle, right_angle) < 55:
-                person_smoke_boxes = smoke_inference.detect_smoke_sahi(img, roi_xyxy=d.xyxy)
+            pose_active = min(left_angle, right_angle) < 55
+
+            if pose_active:
+                state = _sahi_state.get(idd)
+                if state is None:
+                    # 第一次偵測到吸菸姿勢，開啟窗口
+                    _sahi_state[idd] = {
+                        'window_start': now, 'last_sample': 0.0,
+                        'smoke_boxes': [], 'hit': False
+                    }
+                    state = _sahi_state[idd]
+
+                window_elapsed = now - state['window_start']
+                if window_elapsed <= SAHI_WINDOW_SEC:
+                    # 窗口內：每隔 SAHI_SAMPLE_INTERVAL 秒採樣一次
+                    if (now - state['last_sample']) >= SAHI_SAMPLE_INTERVAL:
+                        boxes = smoke_inference.detect_smoke_sahi(img, roi_xyxy=d.xyxy)
+                        state['last_sample'] = now
+                        if boxes:
+                            state['smoke_boxes'] = boxes
+                            state['hit'] = True
+                # 不論窗口是否結束，都沿用窗口內最後一次有偵測到的結果（供畫圖）
+                person_smoke_boxes = state.get('smoke_boxes', [])
                 all_smoke_boxes.extend(person_smoke_boxes)
+            else:
+                # 手放下，清除窗口狀態以便下次重新計時
+                _sahi_state.pop(idd, None)
 
         # ── 吸菸判定計分邏輯 ─────────────────────────────────────────────
         if status == 2:
@@ -176,9 +207,12 @@ def detect_and_draw(pose_result, img, opt):
                             (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX,
                             0.55, (0, 200, 255), 2, cv2.LINE_AA)
 
-        # ── 條件 3：偵測到煙霧與人物區域重疊（中等權重 +10）────────────
-        if _smoke_available and person_smoke_boxes and idd is not None:
-            if smoke_inference.smoke_overlaps_person(person_smoke_boxes, d.xyxy):
+        # ── 條件 3：3 秒採樣窗口內有煙霧命中 → 加分 ──────────────────────
+        state = _sahi_state.get(idd) if idd is not None else None
+        if (_smoke_available and state is not None and state['hit']
+                and (now - state['window_start']) > SAHI_WINDOW_SEC):
+            # 窗口結束且有命中，結算一次
+            if smoke_inference.smoke_overlaps_person(state['smoke_boxes'], d.xyxy):
                 last_smoke = smoke_cooldown.get(idd, 0)
                 if (now - last_smoke) >= BONUS_COOLDOWN_SEC:
                     condition[1] = min(100, int(condition[1]) + SMOKE_BONUS)
@@ -187,6 +221,8 @@ def detect_and_draw(pose_result, img, opt):
                     cv2.putText(img, f"[+{SMOKE_BONUS} Smoke]",
                                 (x1, y1 - 60), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55, (0, 128, 255), 2, cv2.LINE_AA)
+            # 結算後清除窗口，等待下一次姿勢觸發
+            _sahi_state.pop(idd, None)
 
         # ── 條件 2：在同一位置停留超過 10 秒（一般權重 +8）─────────────
         if idd is not None:
