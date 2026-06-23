@@ -5,6 +5,7 @@ import numpy as np
 from ov_inference import cgr_detect_with_onnx
 # import trt_inference_detr
 # import trt_inference_yolo
+import smoke_inference
 
 class Colors:
     def __init__(self):
@@ -66,6 +67,11 @@ BONUS_COOLDOWN_SEC  = 5.0   # 同一條件再次觸發的最短間隔（秒）
 # 一旦某人被 status==2 確認，後續 status==1 改為累加而非遞減
 confirmed_smokers = set()  # {id, ...}
 
+# ── 條件 3：偵測到煙霧與人物重疊（中等權重 +10）────────────────────────
+SMOKE_BONUS         = 10    # 偵測到煙霧時加分
+smoke_cooldown      = {}    # {id: float}  上次觸發時間
+_smoke_available    = None  # 延遲初始化：None=未檢查, True/False=檢查結果
+
 
 def init_model(models):
     model[0]=models
@@ -93,10 +99,20 @@ def judge_smoke(pose_result, img, label):
 
 
 def detect_and_draw(pose_result, img, opt):
+    global _smoke_available
     smoking_threshold = opt.threshold
     cgr_conf[0] = opt.cgr_conf
     cgrlabel = []
     now = time.time()
+
+    # ── 條件 3：每幀執行一次全畫面煙霧偵測 ──────────────────────────────
+    if _smoke_available is None:
+        _smoke_available = smoke_inference.is_model_available()
+        if _smoke_available:
+            print("[func] 煙霧偵測模型已啟用（條件 3）")
+        else:
+            print("[func] 煙霧偵測模型未找到，條件 3 停用（請執行 train_smoke.py 後複製模型）")
+    smoke_boxes = smoke_inference.detect_smoke(img) if _smoke_available else []
 
     for d in pose_result:
         conf, idd = float(d.conf), None if d.id is None else int(d.id)
@@ -151,6 +167,18 @@ def detect_and_draw(pose_result, img, opt):
                             (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX,
                             0.55, (0, 200, 255), 2, cv2.LINE_AA)
 
+        # ── 條件 3：偵測到煙霧與人物區域重疊（中等權重 +10）────────────
+        if _smoke_available and smoke_boxes and idd is not None:
+            if smoke_inference.smoke_overlaps_person(smoke_boxes, d.xyxy):
+                last_smoke = smoke_cooldown.get(idd, 0)
+                if (now - last_smoke) >= BONUS_COOLDOWN_SEC:
+                    condition[1] = min(100, int(condition[1]) + SMOKE_BONUS)
+                    smoke_cooldown[idd] = now
+                    x1, y1 = int(d.xyxy[0]), int(d.xyxy[1])
+                    cv2.putText(img, f"[+{SMOKE_BONUS} Smoke]",
+                                (x1, y1 - 60), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.55, (0, 128, 255), 2, cv2.LINE_AA)
+
         # ── 條件 2：在同一位置停留超過 10 秒（一般權重 +8）─────────────
         if idd is not None:
             box = d.xyxy
@@ -193,6 +221,9 @@ def detect_and_draw(pose_result, img, opt):
     if opt.cig_box:
         for i in cgr_box:
             box_label(i, img, 3, label='Cig', color=(0, 0, 255), txt_color=(255, 255, 255))
+        # 顯示煙霧偵測框（橘色）
+        for s in smoke_boxes:
+            box_label(s[:4], img, 2, label=f'Smoke {s[4]:.2f}', color=(0, 128, 255), txt_color=(255, 255, 255))
 
     return img
 

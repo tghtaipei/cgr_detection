@@ -1,0 +1,16 @@
+# Smoke detection dataset
+# Source: https://universe.roboflow.com/naruesuan-university/smoke-gxoy3
+#
+# 執行以下指令下載資料集後，此檔案會自動更新正確路徑：
+#   python scripts/download_smoke_dataset.py --api-key YOUR_KEY
+#
+# 下載完成後執行訓練：
+#   python train_smoke.py
+
+path: datasets/smoke_roboflow   # 下載後自動更新為絕對路徑
+train: images/train
+val: images/val
+
+nc: 1
+names:
+  - smoke
