@@ -18,7 +18,7 @@ from typing import Tuple
 _session = None
 _MODEL_PATH = Path(__file__).parent / "models" / "smoke_detector.onnx"
 _INPUT_SIZE = 640
-_CONF_THRESHOLD = 0.25  # 降低閾值提升 Recall（現有模型資料量不足，Precision 高 Recall 低）
+_CONF_THRESHOLD = 0.15  # 低閾值提升 Recall，容許較多 FP 以避免漏偵測
 _IOU_THRESHOLD = 0.45
 
 
@@ -237,7 +237,7 @@ def _nms(x1, y1, x2, y2, scores, iou_thr: float) -> list[int]:
     return keep
 
 
-def smoke_overlaps_person(smoke_boxes: list, person_xyxy, iou_threshold: float = 0.05) -> bool:
+def smoke_overlaps_person(smoke_boxes: list, person_xyxy, iou_threshold: float = 0.01) -> bool:
     """
     判斷是否有煙霧框與人體框重疊
 
